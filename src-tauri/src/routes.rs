@@ -1329,6 +1329,9 @@ async fn smc_update(body: Json<Value>) -> Response {
 
 async fn smc_events() -> Response {
     let events = crate::media_controls::drain_events();
-    let items: Vec<String> = events.iter().map(|e| format!("{:?}", e)).collect();
+    let items: Vec<Value> = events
+        .iter()
+        .map(|s| serde_json::from_str(s).unwrap_or(Value::Null))
+        .collect();
     Json(json!({ "events": items })).into_response()
 }

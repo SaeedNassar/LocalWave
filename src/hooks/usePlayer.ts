@@ -215,13 +215,26 @@ export function usePlayer() {
   // Uses subscribe() so state changes don't trigger React re-renders.
 
   useEffect(() => {
-    let lastPush = 0;
-    const push = () => {
-      const now = Date.now();
-      if (now - lastPush < 400) return; // throttle ~2.5x/sec
-      lastPush = now;
+    let lastTrackId: number | null = null;
+    let lastIsPlaying: boolean | null = null;
+    let lastPosition = -1;
+    let lastDuration = -1;
+
+    const push = (force = false) => {
       const s = usePlayerStore.getState();
       const t = s.queue[s.currentIndex];
+      const trackId = t?.id ?? null;
+      // Push on track change, play/pause toggle, seek, or duration change
+      // (duration arrives async via durationchange — after the track-change push).
+      const seeked = lastPosition >= 0 && Math.abs(s.currentTime - lastPosition) > 2;
+      const durationChanged = lastDuration >= 0 && s.duration !== lastDuration;
+      const changed =
+        trackId !== lastTrackId || s.isPlaying !== lastIsPlaying || seeked || durationChanged;
+      lastPosition = s.currentTime;
+      lastDuration = s.duration;
+      lastTrackId = trackId;
+      lastIsPlaying = s.isPlaying;
+      if (!force && !changed) return;
       if (!t) {
         api.smcUpdate({ isPlaying: false, title: '', artist: '', album: '', duration: 0, position: 0 }).catch(() => {});
         return;
@@ -236,9 +249,8 @@ export function usePlayer() {
       }).catch(() => {});
     };
 
-    // Push on any store change (covers track change, play/pause, seek, etc).
-    const unsub = usePlayerStore.subscribe(push);
-    push(); // initial
+    const unsub = usePlayerStore.subscribe(() => push(false));
+    push(true); // initial
 
     // Poll OS media-button events and apply them to the store.
     const poll = setInterval(async () => {
@@ -247,24 +259,27 @@ export function usePlayer() {
         if (!events || events.length === 0) return;
         const s = usePlayerStore.getState();
         for (const evt of events) {
-          switch (evt) {
-            case 'Play':
+          switch (evt.type) {
+            case 'play':
               if (!s.isPlaying) s.togglePlay();
               break;
-            case 'Pause':
+            case 'pause':
               if (s.isPlaying) s.togglePlay();
               break;
-            case 'Toggle':
+            case 'toggle':
               s.togglePlay();
               break;
-            case 'Next':
+            case 'next':
               s.next();
               break;
-            case 'Previous':
+            case 'previous':
               s.prev();
               break;
-            case 'Stop':
+            case 'stop':
               usePlayerStore.setState({ isPlaying: false });
+              break;
+            case 'seek':
+              if (typeof evt.position === 'number') s.seek(evt.position);
               break;
           }
         }

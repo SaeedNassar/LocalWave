@@ -97,16 +97,18 @@ fn main() {
             // Init OS media controls (SMTC) with the main window's HWND.
             // souvlaki requires the HWND for set_metadata to work on Windows;
             // without it, the OS just shows the app name instead of track info.
+            // MediaControls MUST be created on the main thread — a background
+            // thread creates a separate SMTC session that Windows doesn't display.
             if let Some(window) = app.get_webview_window("main") {
                 #[cfg(target_os = "windows")]
                 {
                     let hwnd = window.hwnd().ok().map(|h| h.0 as usize);
-                    localwave_lib::media_controls::init(hwnd);
+                    localwave_lib::media_controls::init(app.handle().clone(), hwnd);
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
                     let _ = window;
-                    localwave_lib::media_controls::init(None);
+                    localwave_lib::media_controls::init(app.handle().clone(), None);
                 }
             }
             Ok(())

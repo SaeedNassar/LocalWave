@@ -1,18 +1,28 @@
 //! Windows System Media Transport Controls (SMTC) integration.
 //!
-//! Runs a dedicated thread that owns the `MediaControls` instance (souvlaki
-//! requires its handle to stay on the thread that created it). The frontend
-//! pushes playback state over an MPSC sender; OS button-press events are
-//! collected into a channel that the frontend polls via HTTP.
+//! The `MediaControls` instance MUST live on the main thread — the same
+//! thread that runs the Tauri / Windows message loop. A background thread
+//! creates a *different* SMTC session that Windows doesn't display as the
+//! default one.
+//!
+//! Architecture:
+//!  - `init()` is called from Tauri's `.setup()` callback (main thread).
+//!  - It creates `MediaControls` in a `thread_local!` on the main thread.
+//!  - Route handlers push state via `update()`, which dispatches work to
+//!    the main thread using `AppHandle::run_on_main_thread()`.
+//!  - OS media-button events are buffered in a global `Mutex<Vec>` that
+//!    the frontend polls via HTTP.
 
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::cell::RefCell;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use once_cell::sync::Lazy;
-use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig};
+use souvlaki::{
+    MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig,
+};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SmcState {
     pub is_playing: bool,
     pub title: String,
@@ -22,213 +32,138 @@ pub struct SmcState {
     pub position_secs: f64,
 }
 
-impl Default for SmcState {
-    fn default() -> Self {
-        Self {
-            is_playing: false,
-            title: String::new(),
-            artist: String::new(),
-            album: String::new(),
-            duration_secs: 0.0,
-            position_secs: 0.0,
+// ── thread_local: lives only on the main thread ──────────────
+
+thread_local! {
+    static CONTROLS: RefCell<Option<MediaControls>> = const { RefCell::new(None) };
+    static CURRENT_STATE: RefCell<SmcState> = RefCell::new(SmcState::default());
+}
+
+// ── Globals accessible from any thread ───────────────────────
+
+/// Buffered OS media-button events (filled from the souvlaki callback).
+static EVENTS: Lazy<Mutex<Vec<MediaControlEvent>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+/// Tauri AppHandle — used to dispatch `set_metadata` / `set_playback` calls
+/// onto the main thread where the `MediaControls` lives.
+static APP_HANDLE: Lazy<Mutex<Option<tauri::AppHandle>>> = Lazy::new(|| Mutex::new(None));
+
+// ── Init (call from Tauri .setup() on the main thread) ──────
+
+pub fn init(app: tauri::AppHandle, hwnd: Option<usize>) {
+    let hwnd_ptr = hwnd.map(|h| h as *mut std::ffi::c_void);
+
+    let config = PlatformConfig {
+        dbus_name: "localwave",
+        display_name: "LocalWave",
+        hwnd: hwnd_ptr,
+    };
+
+    match MediaControls::new(config) {
+        Ok(mut controls) => {
+            let _ = controls.attach(|event: MediaControlEvent| {
+                if let Ok(mut q) = EVENTS.lock() {
+                    q.push(event);
+                }
+            });
+            CONTROLS.with(|c| {
+                *c.borrow_mut() = Some(controls);
+            });
+            log::info!("[smtc] MediaControls created on main thread");
+        }
+        Err(e) => {
+            log::warn!("[smtc] failed to create MediaControls: {:?}", e);
         }
     }
+
+    *APP_HANDLE.lock().unwrap() = Some(app);
 }
 
-/// Commands sent from the frontend (via HTTP) to the media-controls thread.
-pub enum SmcCommand {
-    Update(SmcState),
-    Shutdown,
-}
+// ── Push state from route handlers (any thread) ──────────────
 
-pub struct MediaControlsHandle {
-    pub tx: Sender<SmcCommand>,
-    pub events_rx: Receiver<MediaControlEvent>,
-}
-
-// ── Global singleton ─────────────────────────────────────────
-// The media-controls thread is started once at boot and shared by all
-// axum route handlers. The command sender is cheap to clone; the event
-// receiver is drained by the polling route.
-
-static SMC_HANDLE: Lazy<Mutex<Option<MediaControlsHandle>>> = Lazy::new(|| Mutex::new(None));
-
-/// Initialize the global media-controls singleton. Called once from Tauri's
-/// `.setup()` callback with the main window's HWND.
-/// On non-Windows platforms, `hwnd` should be `None`.
-pub fn init(hwnd: Option<usize>) {
-    if let Some(h) = spawn_media_controls(hwnd) {
-        *SMC_HANDLE.lock().unwrap() = Some(h);
-    }
-}
-
-/// Push a state update to the media-controls thread (non-blocking, best-effort).
+/// Push a state update. Dispatches the actual `set_metadata` / `set_playback`
+/// calls to the main thread via `run_on_main_thread`, because `MediaControls`
+/// lives in a thread_local there.
 pub fn update(state: SmcState) {
-    if let Some(handle) = SMC_HANDLE.lock().unwrap().as_ref() {
-        let _ = handle.tx.send(SmcCommand::Update(state));
-    }
+    let app = APP_HANDLE.lock().unwrap().clone();
+    let Some(app) = app else { return };
+
+    let _ = app.run_on_main_thread(move || {
+        CONTROLS.with(|cell| {
+            let mut controls_ref = cell.borrow_mut();
+            let Some(controls) = controls_ref.as_mut() else { return };
+
+            let prev = CURRENT_STATE.with(|c| c.borrow().clone());
+            let meta_changed = state.title != prev.title
+                || state.artist != prev.artist
+                || state.album != prev.album
+                || state.duration_secs != prev.duration_secs;
+
+            let play_changed = state.is_playing != prev.is_playing;
+            let seeked = (state.position_secs - prev.position_secs).abs() > 1.5;
+
+            // Push metadata when track changes.
+            if meta_changed {
+                if let Err(e) = controls.set_metadata(MediaMetadata {
+                    title: if state.title.is_empty() { None } else { Some(&state.title) },
+                    album: if state.album.is_empty() { None } else { Some(&state.album) },
+                    artist: if state.artist.is_empty() { None } else { Some(&state.artist) },
+                    cover_url: None,
+                    duration: if state.duration_secs > 0.0 {
+                        Some(Duration::from_secs_f64(state.duration_secs))
+                    } else {
+                        None
+                    },
+                }) {
+                    log::warn!("[smtc] set_metadata FAILED: {:?}", e);
+                }
+            }
+
+            // Push playback + timeline on track change, play/pause, or seek.
+            if meta_changed || play_changed || seeked {
+                let progress = if state.duration_secs > 0.0 {
+                    Some(MediaPosition(Duration::from_secs_f64(state.position_secs)))
+                } else {
+                    None
+                };
+                let playback = if state.is_playing {
+                    MediaPlayback::Playing { progress }
+                } else {
+                    MediaPlayback::Paused { progress }
+                };
+                if let Err(e) = controls.set_playback(playback) {
+                    log::warn!("[smtc] set_playback FAILED: {:?}", e);
+                }
+            }
+
+            CURRENT_STATE.with(|c| *c.borrow_mut() = state);
+        });
+    });
 }
 
-/// Drain all pending OS media-button events. Called by the polling route.
-pub fn drain_events() -> Vec<MediaControlEvent> {
+// ── Drain events for the frontend poll route ─────────────────
+
+pub fn drain_events() -> Vec<String> {
     let mut events = Vec::new();
-    if let Some(handle) = SMC_HANDLE.lock().unwrap().as_ref() {
-        while let Ok(event) = handle.events_rx.try_recv() {
-            events.push(event);
+    if let Ok(mut q) = EVENTS.lock() {
+        for event in q.drain(..) {
+            events.push(event_to_json(&event));
         }
     }
     events
 }
 
-// ── Thread + souvlaki ────────────────────────────────────────
-
-/// Spawn the media-controls thread. Returns a handle for sending state updates
-/// and receiving OS media-button events. Best-effort — logs and returns None
-/// if souvlaki fails to init (e.g. unsupported platform).
-///
-/// `hwnd` is the raw window handle (Windows only) — required by souvlaki for
-/// SMTC to function correctly. Without it, `set_metadata` silently fails.
-struct SendPtr(*mut std::ffi::c_void);
-unsafe impl Send for SendPtr {}
-
-fn spawn_media_controls(hwnd: Option<usize>) -> Option<MediaControlsHandle> {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<SmcCommand>();
-    let (evt_tx, evt_rx) = mpsc::channel::<MediaControlEvent>();
-
-    let hwnd_ptr = hwnd.map(|h| SendPtr(h as *mut std::ffi::c_void));
-
-    let init_result = std::thread::Builder::new()
-        .name("localwave-smtc".into())
-        .spawn(move || run_loop(cmd_rx, evt_tx, hwnd_ptr));
-
-    if init_result.is_err() {
-        log::warn!("[smtc] failed to spawn media-controls thread");
-        return None;
-    }
-
-    log::info!("[smtc] media controls thread started (hwnd={})", hwnd.is_some());
-    Some(MediaControlsHandle {
-        tx: cmd_tx,
-        events_rx: evt_rx,
-    })
-}
-
-fn run_loop(cmd_rx: Receiver<SmcCommand>, evt_tx: Sender<MediaControlEvent>, hwnd: Option<SendPtr>) {
-    // On Windows, souvlaki's SMTC backend uses COM. We must initialize COM on
-    // this thread before creating the MediaControls instance.
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-    }
-
-    let config = PlatformConfig {
-        dbus_name: "localwave",
-        display_name: "LocalWave",
-        hwnd: hwnd.map(|h| h.0),
-    };
-
-    let mut controls = match MediaControls::new(config) {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("[smtc] failed to create MediaControls: {:?}", e);
-            return;
+fn event_to_json(event: &MediaControlEvent) -> String {
+    match event {
+        MediaControlEvent::Play => r#"{"type":"play"}"#.into(),
+        MediaControlEvent::Pause => r#"{"type":"pause"}"#.into(),
+        MediaControlEvent::Toggle => r#"{"type":"toggle"}"#.into(),
+        MediaControlEvent::Next => r#"{"type":"next"}"#.into(),
+        MediaControlEvent::Previous => r#"{"type":"prev"}"#.into(),
+        MediaControlEvent::Stop => r#"{"type":"stop"}"#.into(),
+        MediaControlEvent::SetPosition(pos) => {
+            format!(r#"{{"type":"seek","position":{}}}"#, pos.0.as_secs_f64())
         }
-    };
-
-    let tx_clone = evt_tx.clone();
-    if let Err(e) = controls.attach(move |event: MediaControlEvent| {
-        let _ = tx_clone.send(event);
-    }) {
-        log::warn!("[smtc] failed to attach event handler: {:?}", e);
-        return;
-    }
-
-    log::info!("[smtc] attached — listening for OS media button events");
-    let _ = controls.set_playback(MediaPlayback::Stopped);
-
-    let mut current = SmcState::default();
-
-    loop {
-        loop {
-            match cmd_rx.try_recv() {
-                Ok(SmcCommand::Update(state)) => apply_state(&mut controls, &mut current, &state),
-                Ok(SmcCommand::Shutdown) => {
-                    log::info!("[smtc] shutdown received — stopping");
-                    let _ = controls.set_playback(MediaPlayback::Stopped);
-                    return;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    log::info!("[smtc] command channel disconnected — stopping");
-                    return;
-                }
-            }
-        }
-
-        #[cfg(target_os = "windows")]
-        pump_windows_messages();
-
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn apply_state(controls: &mut MediaControls, current: &mut SmcState, state: &SmcState) {
-    let meta_changed = state.title != current.title
-        || state.artist != current.artist
-        || state.album != current.album
-        || state.duration_secs != current.duration_secs;
-
-    if meta_changed {
-        if let Err(e) = controls.set_metadata(MediaMetadata {
-            title: if state.title.is_empty() { None } else { Some(&state.title) },
-            album: if state.album.is_empty() { None } else { Some(&state.album) },
-            artist: if state.artist.is_empty() { None } else { Some(&state.artist) },
-            cover_url: None,
-            duration: if state.duration_secs > 0.0 {
-                Some(Duration::from_secs_f64(state.duration_secs))
-            } else {
-                None
-            },
-        }) {
-            log::warn!("[smtc] set_metadata FAILED: {:?}", e);
-        }
-    }
-
-    let playback_changed = state.is_playing != current.is_playing
-        || (state.is_playing && (state.position_secs - current.position_secs).abs() > 1.0);
-
-    if playback_changed {
-        let progress = if state.duration_secs > 0.0 {
-            Some(MediaPosition(Duration::from_secs_f64(state.position_secs)))
-        } else {
-            None
-        };
-
-        let playback = if state.is_playing {
-            MediaPlayback::Playing { progress }
-        } else {
-            MediaPlayback::Paused { progress }
-        };
-        if let Err(e) = controls.set_playback(playback) {
-            log::warn!("[smtc] set_playback FAILED: {:?}", e);
-        }
-    }
-
-    *current = state.clone();
-}
-
-#[cfg(target_os = "windows")]
-fn pump_windows_messages() {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
-    };
-
-    unsafe {
-        let mut msg = MSG::default();
-        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).into() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        _ => format!(r#"{{"type":"{:?}"}}"#, event),
     }
 }

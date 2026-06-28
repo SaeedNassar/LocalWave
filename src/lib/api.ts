@@ -158,5 +158,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(state),
     }),
-  smcEvents: () => http<{ events: string[] }>(`/smc/events`),
+  smcEvents: () =>
+    http<{ events: { type: string; position?: number }[] }>(`/smc/events`),
 };

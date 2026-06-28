@@ -68,11 +68,6 @@ sha1 = "0.10"
 souvlaki = "0.8"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.58", features = [
-    "Win32_UI_WindowsAndMessaging",
-    "Win32_Foundation",
-    "Win32_System_Com",
-] }
 raw-window-handle = "0.6"
 
 [profile.release]
