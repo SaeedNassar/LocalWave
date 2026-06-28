@@ -1,0 +1,77 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    font-family: theme('fontFamily.sans');
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background-color: #121212;
+    color: #ffffff;
+  }
+
+  /* scrollbar styling — dark themed, blends into the UI */
+  ::-webkit-scrollbar {
+    width: 12px;
+    height: 12px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #4d4d4d;
+    border-radius: 9999px;
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #6a6a6a;
+    background-clip: content-box;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 font-bold transition-colors duration-150 disabled:opacity-50 disabled:pointer-events-none;
+  }
+
+  .btn-pill {
+    @apply btn rounded-pill bg-surface-mid px-4 py-2 text-sm text-ink-base hover:bg-surface-card;
+  }
+
+  .btn-brand {
+    @apply btn rounded-pill bg-brand px-5 py-2 text-sm text-base hover:bg-brand-hover;
+  }
+
+  .btn-outlined {
+    @apply btn rounded-pill border border-edge-light px-4 py-1 text-sm text-ink-base hover:border-ink-base;
+  }
+
+  .nav-link {
+    @apply flex items-center gap-4 px-3 py-2 text-sm font-bold text-ink-muted transition-colors hover:text-ink-base;
+  }
+
+  .nav-link-active {
+    @apply text-ink-base;
+  }
+
+  .card {
+    @apply rounded-lg bg-surface p-4 transition-colors duration-200 hover:bg-surface-card;
+  }
+
+  .input-pill {
+    @apply rounded-pill-lg bg-surface-mid px-4 py-3 text-sm text-ink-base placeholder:text-ink-faint focus:outline-none;
+    box-shadow: rgb(18, 18, 18) 0px 1px 0px, rgb(124, 124, 124) 0px 0px 0px 1px inset;
+  }
+  .input-pill:focus {
+    box-shadow: rgb(0, 0, 0) 0px 0px 0px 1px inset, rgb(124, 124, 124) 0px 0px 0px 1px inset;
+  }
+}
