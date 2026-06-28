@@ -5,7 +5,7 @@ import { useUIStore } from './ui';
 
 export type RepeatMode = 'off' | 'all' | 'one';
 
-interface PlayerState {
+export interface PlayerState {
   // queue
   queue: Track[];
   currentIndex: number;
@@ -162,8 +162,18 @@ export const usePlayerStore = create<PlayerState>()(
     {
       name: 'localwave-player',
       storage: createJSONStorage(() => localStorage),
-      // persist only user prefs, not playback state
-      partialize: (s) => ({ volume: s.volume, muted: s.muted, shuffle: s.shuffle, repeat: s.repeat }),
+      // Persist user prefs + playback session (queue/currentIndex/currentTime)
+      // so the app resumes where it left off. currentTime is throttled by the
+      // audio bridge in usePlayer.ts (every 3s + on pause/unload).
+      partialize: (s) => ({
+        volume: s.volume,
+        muted: s.muted,
+        shuffle: s.shuffle,
+        repeat: s.repeat,
+        queue: s.queue,
+        currentIndex: s.currentIndex,
+        currentTime: s.currentTime,
+      }),
     },
   ),
 );

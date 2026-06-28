@@ -11,6 +11,7 @@ pub mod config;
 pub mod db;
 pub mod import_playlist;
 pub mod lyrics;
+pub mod media_controls;
 pub mod metadata;
 pub mod m3u_parser;
 pub mod musixmatch;

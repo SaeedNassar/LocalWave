@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react';
-import { usePlayerStore } from '../store/player';
+import { usePlayerStore, type PlayerState } from '../store/player';
 import { api } from '../lib/api';
 
 /**
@@ -39,6 +39,19 @@ export function usePlayer() {
   // inflate play counts on the server.
   const countedPlayRef = useRef<number | null>(null);
 
+  // On first mount only: if a queue was restored from localStorage, force
+  // paused state (browsers block autoplay after reload) and remember that we
+  // need to seek to the saved position once metadata loads.
+  const restoredSeekRef = useRef<number | null>(null);
+  useEffect(() => {
+    const s = usePlayerStore.getState();
+    if (s.queue.length > 0 && s.currentIndex >= 0) {
+      usePlayerStore.setState({ isPlaying: false });
+      restoredSeekRef.current = s.currentTime > 0 ? s.currentTime : null;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // load source when track changes
   useEffect(() => {
     const audio = audioRef.current;
@@ -55,6 +68,21 @@ export function usePlayer() {
     audio.src = api.streamUrl(currentTrack.id);
     audio.load();
     countedPlayRef.current = null;
+
+    // On boot the store hydrates with a saved currentTime from the last session.
+    // Seek the audio element to that position once metadata has loaded, so the
+    // user resumes where they left off. Only fires once per track load.
+    const savedTime = usePlayerStore.getState().currentTime;
+    if (savedTime > 0 && Number.isFinite(savedTime)) {
+      const onLoaded = () => {
+        if (Number.isFinite(audio.duration) && savedTime < audio.duration) {
+          audio.currentTime = savedTime;
+        }
+        audio.removeEventListener('loadedmetadata', onLoaded);
+      };
+      audio.addEventListener('loadedmetadata', onLoaded);
+    }
+
     if (isPlaying) {
       audio
         .play()
@@ -180,6 +208,121 @@ export function usePlayer() {
       }
     };
   }, [setCurrentTime]);
+
+  // ── Windows System Media Transport Controls (SMTC) ───────────
+  // Push playback state to the OS media overlay + poll for hardware
+  // button presses (play/pause/next/prev on keyboards, headsets, etc).
+  // Uses subscribe() so state changes don't trigger React re-renders.
+
+  useEffect(() => {
+    let lastPush = 0;
+    const push = () => {
+      const now = Date.now();
+      if (now - lastPush < 400) return; // throttle ~2.5x/sec
+      lastPush = now;
+      const s = usePlayerStore.getState();
+      const t = s.queue[s.currentIndex];
+      if (!t) {
+        api.smcUpdate({ isPlaying: false, title: '', artist: '', album: '', duration: 0, position: 0 }).catch(() => {});
+        return;
+      }
+      api.smcUpdate({
+        isPlaying: s.isPlaying,
+        title: t.title,
+        artist: t.artist ?? '',
+        album: t.album ?? '',
+        duration: s.duration,
+        position: s.currentTime,
+      }).catch(() => {});
+    };
+
+    // Push on any store change (covers track change, play/pause, seek, etc).
+    const unsub = usePlayerStore.subscribe(push);
+    push(); // initial
+
+    // Poll OS media-button events and apply them to the store.
+    const poll = setInterval(async () => {
+      try {
+        const { events } = await api.smcEvents();
+        if (!events || events.length === 0) return;
+        const s = usePlayerStore.getState();
+        for (const evt of events) {
+          switch (evt) {
+            case 'Play':
+              if (!s.isPlaying) s.togglePlay();
+              break;
+            case 'Pause':
+              if (s.isPlaying) s.togglePlay();
+              break;
+            case 'Toggle':
+              s.togglePlay();
+              break;
+            case 'Next':
+              s.next();
+              break;
+            case 'Previous':
+              s.prev();
+              break;
+            case 'Stop':
+              usePlayerStore.setState({ isPlaying: false });
+              break;
+          }
+        }
+      } catch { /* ignore */ }
+    }, 500);
+
+    return () => { unsub(); clearInterval(poll); };
+  }, []);
+
+  // Persist playback position so the session can be resumed after restart.
+  // currentTime updates ~4×/sec via timeupdate, but persisting on every tick
+  // would hammer localStorage. Throttle: write at most every 3s while playing,
+  // and immediately on pause, track change, and before the page unloads.
+  useEffect(() => {
+    const flush = () => {
+      const s = usePlayerStore.getState();
+      if (s.currentTime > 0) {
+        usePlayerStore.persist.setOptions({
+          partialize: (st: PlayerState) => ({
+            queue: st.queue,
+            currentIndex: st.currentIndex,
+            currentTime: st.currentTime,
+            duration: st.duration,
+            volume: st.volume,
+            muted: st.muted,
+            shuffle: st.shuffle,
+            repeat: st.repeat,
+          }),
+        });
+        // Direct localStorage write — avoids re-triggering store subscribers.
+        try {
+          localStorage.setItem('localwave-player', JSON.stringify({
+            state: {
+              queue: s.queue,
+              currentIndex: s.currentIndex,
+              currentTime: s.currentTime,
+              duration: s.duration,
+              volume: s.volume,
+              muted: s.muted,
+              shuffle: s.shuffle,
+              repeat: s.repeat,
+            },
+            version: 0,
+          }));
+        } catch { /* quota / private mode — ignore */ }
+      }
+    };
+
+    const timer = setInterval(flush, 3000);
+    const onBeforeUnload = () => flush();
+    window.addEventListener('beforeunload', onBeforeUnload);
+
+    return () => {
+      flush(); // save on unmount too
+      clearInterval(timer);
+      window.removeEventListener('beforeunload', onBeforeUnload);
+    };
+  }, []);
 
   // unmount cleanup: pause + release the audio element (guards against StrictMode
   // double-mount in dev leaving an orphaned element playing).

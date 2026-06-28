@@ -144,4 +144,19 @@ export const api = {
     http<{ items: ArtistWithRole[] }>(`/tracks/${trackId}/artists`),
   getFeatures: () => http<Features>(`/features`),
   artistImageUrl: (artistId: number) => `${BASE}/artist-image/${artistId}`,
+
+  // system media controls (Windows SMTC)
+  smcUpdate: (state: {
+    isPlaying: boolean;
+    title: string;
+    artist: string;
+    album: string;
+    duration: number;
+    position: number;
+  }) =>
+    http<{ ok: boolean }>(`/smc/update`, {
+      method: 'POST',
+      body: JSON.stringify(state),
+    }),
+  smcEvents: () => http<{ events: string[] }>(`/smc/events`),
 };

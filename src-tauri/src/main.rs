@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! LocalWave desktop app entry point.
 //!
 //! 1. Initialises logging, config, data directory, and SQLite pool.
@@ -90,8 +92,23 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .on_window_event(move |_window, _event| {})
-        .setup(move |_app| {
-            // any app-specific setup can go here
+        .setup(move |app| {
+            use tauri::Manager;
+            // Init OS media controls (SMTC) with the main window's HWND.
+            // souvlaki requires the HWND for set_metadata to work on Windows;
+            // without it, the OS just shows the app name instead of track info.
+            if let Some(window) = app.get_webview_window("main") {
+                #[cfg(target_os = "windows")]
+                {
+                    let hwnd = window.hwnd().ok().map(|h| h.0 as usize);
+                    localwave_lib::media_controls::init(hwnd);
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let _ = window;
+                    localwave_lib::media_controls::init(None);
+                }
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

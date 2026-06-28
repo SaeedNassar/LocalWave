@@ -1004,21 +1004,42 @@ async fn cover_track(State(state): State<AppState>, AxumPath(track_id): AxumPath
     let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
-    let album_id: Option<i64> = conn.query_row("SELECT album_id FROM tracks WHERE id = ?", [track_id], |row| row.get(0)).ok();
-    let Some(album_id) = album_id else {
-        return err(StatusCode::NOT_FOUND, "Track not found");
-    };
-    let cover_path: Option<String> = conn.query_row(
-        "SELECT path FROM tracks WHERE album_id = ? AND has_cover = 1 LIMIT 1",
-        [album_id],
-        |row| row.get(0),
-    ).ok().or_else(|| {
-        conn.query_row(
-            "SELECT path FROM tracks WHERE album_id = ? LIMIT 1",
-            [album_id],
+
+    // Prefer the requested track's OWN embedded cover first — this prevents
+    // cross-contamination when multiple releases share the same album name +
+    // album_artist (the scanner dedupes albums by those two columns only).
+    // Only if the track itself has no cover do we fall back to a sibling track
+    // in the same album (e.g. one file with art for the whole album).
+    let cover_path: Option<String> = conn
+        .query_row(
+            "SELECT path FROM tracks WHERE id = ? AND has_cover = 1",
+            [track_id],
             |row| row.get(0),
-        ).ok()
-    });
+        )
+        .ok()
+        .or_else(|| {
+            let album_id: Option<i64> = conn
+                .query_row("SELECT album_id FROM tracks WHERE id = ?", [track_id], |row| row.get(0))
+                .ok()
+                .flatten();
+            album_id.and_then(|aid| {
+                conn.query_row(
+                    "SELECT path FROM tracks WHERE album_id = ? AND has_cover = 1 ORDER BY id LIMIT 1",
+                    [aid],
+                    |row| row.get(0),
+                )
+                .ok()
+                .or_else(|| {
+                    conn.query_row(
+                        "SELECT path FROM tracks WHERE album_id = ? ORDER BY id LIMIT 1",
+                        [aid],
+                        |row| row.get(0),
+                    )
+                    .ok()
+                })
+            })
+        });
+
     let Some(cover_path) = cover_path else {
         return err(StatusCode::NOT_FOUND, "No cover");
     };
@@ -1284,4 +1305,30 @@ pub fn build_router() -> Router<AppState> {
         .route("/api/tracks/:track_id/artists", get(get_track_artists))
         .route("/api/follows", get(get_follows))
         .route("/api/follows/:artist_id", post(follow_artist))
+        .route("/api/smc/update", post(smc_update))
+        .route("/api/smc/events", get(smc_events))
+}
+
+// ════════════════════════════════════════════════════════════
+// SYSTEM MEDIA CONTROLS (SMTC)
+// ════════════════════════════════════════════════════════════
+
+async fn smc_update(body: Json<Value>) -> Response {
+    let v = body.0;
+    let state = crate::media_controls::SmcState {
+        is_playing: v.get("isPlaying").and_then(|x| x.as_bool()).unwrap_or(false),
+        title: v.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        artist: v.get("artist").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        album: v.get("album").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        duration_secs: v.get("duration").and_then(|x| x.as_f64()).unwrap_or(0.0),
+        position_secs: v.get("position").and_then(|x| x.as_f64()).unwrap_or(0.0),
+    };
+    crate::media_controls::update(state);
+    Json(json!({ "ok": true })).into_response()
+}
+
+async fn smc_events() -> Response {
+    let events = crate::media_controls::drain_events();
+    let items: Vec<String> = events.iter().map(|e| format!("{:?}", e)).collect();
+    Json(json!({ "events": items })).into_response()
 }
