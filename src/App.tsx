@@ -24,6 +24,26 @@ export default function App() {
     useLibraryStore.getState().loadAll();
   }, []);
 
+  // The backend's initial scan (which auto-imports playlists) runs after the
+  // server starts — typically finishing a few seconds after the frontend boots.
+  // Poll scan status; when playlist count changes, reload the sidebar's list.
+  useEffect(() => {
+    let prev: number | null = null;
+    const timer = setInterval(async () => {
+      try {
+        await useLibraryStore.getState().refreshStatus();
+        const cur = useLibraryStore.getState().scanStatus?.playlists ?? 0;
+        if (prev !== null && cur !== prev) {
+          await useLibraryStore.getState().loadPlaylists();
+        }
+        prev = cur;
+      } catch {
+        /* ignore */
+      }
+    }, 3000);
+    return () => clearInterval(timer);
+  }, []);
+
   return (
     <div className="flex h-screen flex-col bg-base">
       <div className="relative flex min-h-0 flex-1 gap-2 p-2 pb-0">

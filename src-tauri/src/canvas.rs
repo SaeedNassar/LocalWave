@@ -292,76 +292,91 @@ pub async fn get_canvas_for_track(pool: &DbPool, track_id: i64) -> Option<Canvas
         }
     };
 
-    // 2. Fetch tokens (network — no DB connection held)
-    log::info!("[canvas] Step 2: Fetching Spotify tokens...");
-    let (access_token, client_token) = match get_tokens(Some(&cfg.sp_dc)).await {
-        Ok(t) => {
-            log::info!("[canvas] Tokens obtained — access_token length={}, client_token length={}", t.0.len(), t.1.len());
-            log::info!("[canvas] access_token (first 30 chars): {}...", &t.0[..t.0.len().min(30)]);
-            log::info!("[canvas] client_token (first 30 chars): {}...", &t.1[..t.1.len().min(30)]);
-            t
-        }
-        Err(e) => {
-            log::error!("[canvas] Token fetch FAILED: {}", e);
-            return None;
-        }
-    };
-
-    // 3. Search track ID (network — no DB connection held)
+    // 2–4. Search track ID + fetch canvas URL with retry-on-error.
+    //      Every retry invalidates the token cache and fetches fresh tokens,
+    //      so a 401 / expired-token error is self-healing rather than fatal.
+    const MAX_ATTEMPTS: usize = 3;
     let query = format!("{} {}", artist.as_deref().unwrap_or(""), title);
-    log::info!("[canvas] Step 3: Searching Spotify for: \"{}\"", query);
-	let spotify_track_id = match search_track_id(&title,
-			artist.as_deref().unwrap_or(""),
-			&access_token,
-			&client_token,
-	)
-	.await
-	{
-		Ok(Some(id)) => {
-			log::info!("[canvas] Spotify track ID found: {} (uri: spotify:track:{})", id, id);
-			id
-		}
-		Ok(None) => {
-			log::info!("[canvas] No Spotify track found in search results — caching negative");
-			cache_negative(pool, track_id);
-			return None;
-		}
-		Err(ApiError::RateLimited { retry_after_ms }) => {
-			log::warn!(
-				"[canvas] Track search rate-limited (retry_after_ms={:?}) — NOT caching negative",
-				retry_after_ms
-			);
-			return None;
-		}
-		Err(e) => {
-			log::error!("[canvas] Track search FAILED: {}", e);
-			return None;
-		}
-	};
+    let mut spotify_track_id: Option<String> = None;
+    let mut result: Option<CanvasResult> = None;
 
-    // 4. Fetch canvas URL (network — no DB connection held)
-    let track_uri = format!("spotify:track:{}", spotify_track_id);
-    log::info!("[canvas] Step 4: Fetching canvas for uri={}", track_uri);
-	let result = match fetch_canvas_url(&spotify_track_id, &access_token).await {
-        Ok(Some(r)) => {
-            log::info!("[canvas] Canvas URL found: {}", r.url);
-            log::info!("[canvas] Canvas artist: {:?} ({:?})", r.artist_name, r.artist_uri);
-            r
+    'outer: for attempt in 1..=MAX_ATTEMPTS {
+        if attempt > 1 {
+            log::info!("[canvas] Retry attempt {}/{} — invalidating tokens and refetching...", attempt, MAX_ATTEMPTS);
+            crate::spotify_auth::invalidate_tokens().await;
         }
-        Ok(None) => {
-            log::info!("[canvas] No canvas returned for this track — caching negative");
-            cache_negative(pool, track_id);
-            return None;
+
+        // 2. Fetch tokens
+        let (access_token, client_token) = match get_tokens(Some(&cfg.sp_dc)).await {
+            Ok(t) => {
+                log::info!("[canvas] Attempt {} — tokens OK (access len={}, client len={})", attempt, t.0.len(), t.1.len());
+                t
+            }
+            Err(e) => {
+                log::error!("[canvas] Attempt {} — token fetch FAILED: {}", attempt, e);
+                continue;
+            }
+        };
+
+        // 3. Search track ID (only once — cached for subsequent canvas fetch attempts)
+        if spotify_track_id.is_none() {
+            log::info!("[canvas] Attempt {} — searching Spotify for: \"{}\"", attempt, query);
+            match search_track_id(&title, artist.as_deref().unwrap_or(""), &access_token, &client_token).await {
+                Ok(Some(id)) => {
+                    log::info!("[canvas] Spotify track ID found: {}", id);
+                    spotify_track_id = Some(id);
+                }
+                Ok(None) => {
+                    log::info!("[canvas] No Spotify track found in search results — caching negative");
+                    cache_negative(pool, track_id);
+                    return None; // not a token problem — no point retrying
+                }
+                Err(ApiError::RateLimited { retry_after_ms }) => {
+                    log::warn!("[canvas] Search rate-limited (retry_after_ms={:?}) on attempt {} — retrying", retry_after_ms, attempt);
+                    if let Some(ms) = retry_after_ms {
+                        tokio::time::sleep(std::time::Duration::from_millis(ms.max(500) as u64)).await;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    log::warn!("[canvas] Search FAILED on attempt {}: {} — will retry with fresh tokens", attempt, e);
+                    continue;
+                }
+            }
         }
-        Err(ApiError::RateLimited { retry_after_ms }) => {
-            log::warn!(
-                "[canvas] Canvas fetch rate-limited (retry_after_ms={:?}) — NOT caching negative",
-                retry_after_ms
-            );
-            return None;
+
+        // 4. Fetch canvas URL
+        let tid = spotify_track_id.as_deref().unwrap_or("");
+        log::info!("[canvas] Attempt {} — fetching canvas for spotify:track:{}", attempt, tid);
+        match fetch_canvas_url(tid, &access_token).await {
+            Ok(Some(r)) => {
+                log::info!("[canvas] Canvas URL found: {}", r.url);
+                result = Some(r);
+                break 'outer;
+            }
+            Ok(None) => {
+                log::info!("[canvas] No canvas returned for this track — caching negative");
+                cache_negative(pool, track_id);
+                return None; // track genuinely has no canvas — no point retrying
+            }
+            Err(ApiError::RateLimited { retry_after_ms }) => {
+                log::warn!("[canvas] Canvas fetch rate-limited (retry_after_ms={:?}) on attempt {} — retrying", retry_after_ms, attempt);
+                if let Some(ms) = retry_after_ms {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms.max(500) as u64)).await;
+                }
+                continue;
+            }
+            Err(e) => {
+                log::warn!("[canvas] Canvas fetch FAILED on attempt {}: {} — will retry with fresh tokens", attempt, e);
+                continue;
+            }
         }
-        Err(e) => {
-            log::error!("[canvas] Canvas fetch FAILED: {}", e);
+    }
+
+    let result = match result {
+        Some(r) => r,
+        None => {
+            log::error!("[canvas] All {} attempts exhausted for track_id={} — giving up (NOT caching negative)", MAX_ATTEMPTS, track_id);
             return None;
         }
     };

@@ -31,10 +31,15 @@ export function LibraryPage() {
     (async () => {
       for (const a of visibleArtists) {
         if (cancelled) return;
-        if (a.imagePath) { setArtistImages((prev) => ({ ...prev, [a.id]: a.imagePath })); continue; }
+        if (a.imagePath) {
+          const p: string | null = a.imagePath;
+          setArtistImages((prev) => ({ ...prev, [a.id]: p }));
+          continue;
+        }
         try {
           const r = await api.getArtistImage(a.id);
-          if (!cancelled) setArtistImages((prev) => ({ ...prev, [a.id]: r.imageUrl ?? null }));
+          const url: string | null = r.imageUrl ?? null;
+          if (!cancelled) setArtistImages((prev) => ({ ...prev, [a.id]: url }));
         } catch { if (!cancelled) setArtistImages((prev) => ({ ...prev, [a.id]: null })); }
       }
     })();
