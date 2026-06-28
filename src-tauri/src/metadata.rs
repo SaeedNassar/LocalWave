@@ -8,7 +8,7 @@ use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::prelude::Accessor;
-use lofty::tag::{ItemKey, Tag, TagExt};
+use lofty::tag::{ItemKey, Tag};
 
 use crate::types::{CoverArt, TrackMetadata};
 

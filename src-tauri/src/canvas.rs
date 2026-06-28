@@ -2,7 +2,6 @@
 //! Looks up a Spotify Canvas video URL for a local track, with SQLite caching.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use prost::Message;
 use reqwest::Method;
@@ -393,7 +392,7 @@ pub async fn get_canvas_for_track(pool: &DbPool, track_id: i64) -> Option<Canvas
 }
 
 fn cache_negative(pool: &DbPool, track_id: i64) {
-    if let Ok(mut conn) = get_conn(pool) {
+    if let Ok(conn) = get_conn(pool) {
         let now = chrono::Utc::now().to_rfc3339();
         let _ = conn.execute(
             "INSERT OR REPLACE INTO canvas_url_cache (track_id, url, fetched_at) VALUES (?, '', ?)",

@@ -2,7 +2,6 @@
 //! row-shaping helpers. Mirrors `server/src/db.ts`.
 
 use std::path::Path;
-use std::sync::Arc;
 
 use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
@@ -56,13 +55,6 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, D
         }
     }
     Ok(false)
-}
-
-fn table_exists(conn: &Connection, table: &str) -> Result<bool, DbError> {
-    let mut stmt = conn.prepare(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name=?")?;
-    let exists = stmt.exists([table])?;
-    Ok(exists)
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), DbError> {
@@ -312,7 +304,7 @@ fn backfill_artists(conn: &mut Connection) -> Result<(), DbError> {
             clear_track_artists.execute([track_id])?;
             let mut primary_id: Option<i64> = None;
             for pa in &parsed {
-                let mut id: i64 = match get_by_norm.query_row([&pa.normalized_name], |row| row.get::<_, i64>(0)) {
+                let id: i64 = match get_by_norm.query_row([&pa.normalized_name], |row| row.get::<_, i64>(0)) {
                     Ok(id) => {
                         set_norm.execute([&pa.normalized_name, &id.to_string()])?;
                         id

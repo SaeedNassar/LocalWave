@@ -1,6 +1,6 @@
 //! Library scanner. Faithful port of `server/src/services/scanner.ts`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,9 +10,9 @@ use rusqlite::{params, Connection};
 use walkdir::WalkDir;
 
 use crate::artist_parser::{normalize_artist_name, split_artists};
-use crate::db::{attach_track_artists, get_conn, row_to_track, DbPool};
+use crate::db::{get_conn, DbPool};
 use crate::metadata::parse_track_metadata;
-use crate::types::{ScanProgress, Track};
+use crate::types::ScanProgress;
 
 pub const PLAYLIST_EXTS: Lazy<HashSet<String>> =
     Lazy::new(|| [".m3u".to_string(), ".m3u8".to_string()].into_iter().collect());

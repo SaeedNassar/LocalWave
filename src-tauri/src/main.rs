@@ -7,8 +7,6 @@
 
 use std::sync::Arc;
 
-use tauri::Manager;
-
 use localwave_lib::config::{ensure_data_dir, load_config};
 use localwave_lib::db::init_pool;
 use localwave_lib::routes::build_router;
@@ -17,8 +15,6 @@ use localwave_lib::spotify_auth::init_spotify_auth;
 use localwave_lib::state::init_pool as init_state_pool;
 use localwave_lib::watcher::start_watcher;
 use localwave_lib::AppState;
-
-const DEFAULT_HTTP_PORT: u16 = 8787;
 
 fn main() {
     // Initialize env logger; RUST_LOG=info,localwave=debug in dev.

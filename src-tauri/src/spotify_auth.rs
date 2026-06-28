@@ -2,7 +2,6 @@
 //! Includes TOTP initialization from GitHub secrets or fallback, access/client
 //! token fetching, caching, expiry, and automatic periodic refresh.
 
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};

@@ -7,9 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use notify_debouncer_full::{new_debouncer, DebounceEventResult, Debouncer, FileIdMap};
-use rusqlite::params;
 
-use crate::db::{get_conn, DbPool};
+use crate::db::DbPool;
 use crate::scanner::{remove_playlist_by_path, remove_track_by_path, scan_single_file, PLAYLIST_EXTS};
 
 pub struct Watcher {
@@ -29,45 +28,6 @@ fn is_playlist(path: &Path) -> bool {
 
 fn is_supported(path: &Path, exts: &[Arc<str>]) -> bool {
     is_audio(path, exts) || is_playlist(path)
-}
-
-fn prune_tracks_under(pool: &DbPool, dir: &Path) {
-    let Ok(conn) = get_conn(pool) else { return };
-    let prefix = if dir.to_string_lossy().ends_with(std::path::MAIN_SEPARATOR) {
-        dir.to_path_buf()
-    } else {
-        let mut d = dir.to_path_buf();
-        d.push(""); // appends separator
-        d
-    };
-    let prefix_lower = prefix.to_string_lossy().to_lowercase();
-
-    let mut stmt = match conn.prepare("SELECT id, path FROM tracks") {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let to_delete: Vec<i64> = stmt
-        .query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let path: String = row.get(1)?;
-            Ok((id, path))
-        })
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|r| r.ok())
-        .filter(|(_, p)| p.to_lowercase().starts_with(&prefix_lower))
-        .map(|(id, _)| id)
-        .collect();
-    drop(stmt);
-
-    if to_delete.is_empty() {
-        return;
-    }
-    log::info!("[watcher] pruned {} tracks under {}", to_delete.len(), dir.display());
-    for id in to_delete {
-        let _ = conn.execute("DELETE FROM tracks WHERE id = ?", [id]);
-    }
 }
 
 pub fn start_watcher(pool: DbPool, music_folder: String, supported_extensions: Vec<Arc<str>>) -> Option<Watcher> {

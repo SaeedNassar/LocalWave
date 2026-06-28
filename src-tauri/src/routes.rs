@@ -2,19 +2,18 @@
 //! `server/src/routes/*.ts`, exposing the same `/api/*` surface.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::config::{load_config, patch_config};
-use crate::db::{attach_track_artists, get_conn, row_to_track, DbPool};
+use crate::db::{attach_track_artists, get_conn, row_to_track};
 use crate::metadata::{read_track_metadata, update_track_metadata, MetadataUpdate};
 use crate::scanner::scan_library;
 use crate::types::*;
@@ -59,7 +58,7 @@ async fn get_tracks(State(state): State<AppState>, Query(q): Query<TracksQuery>)
     let limit = clamp_int(q.limit.as_deref(), 1, 2000, 500);
     let offset = clamp_int(q.offset.as_deref(), 0, 1_000_000, 0);
 
-    let Ok(mut conn) = get_conn(pool) else {
+    let Ok(conn) = get_conn(pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
 
@@ -103,7 +102,7 @@ async fn search(State(state): State<AppState>, Query(q): Query<TracksQuery>) -> 
     };
     let like = like_pattern(&query);
 
-    let Ok(mut conn) = get_conn(pool) else {
+    let Ok(conn) = get_conn(pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
 
@@ -183,7 +182,7 @@ async fn search(State(state): State<AppState>, Query(q): Query<TracksQuery>) -> 
 }
 
 async fn get_albums(State(state): State<AppState>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let mut stmt = match conn.prepare(
@@ -216,7 +215,7 @@ async fn get_albums(State(state): State<AppState>) -> Response {
 }
 
 async fn get_album(State(state): State<AppState>, AxumPath(id): AxumPath<i64>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let album = conn.query_row(
@@ -258,7 +257,7 @@ async fn get_album(State(state): State<AppState>, AxumPath(id): AxumPath<i64>) -
 // ── artists ─────────────────────────────────────────────────
 
 async fn get_artists(State(state): State<AppState>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let mut stmt = match conn.prepare(
@@ -295,7 +294,7 @@ async fn get_artists(State(state): State<AppState>) -> Response {
 }
 
 async fn get_artist(State(state): State<AppState>, AxumPath(id): AxumPath<i64>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let artist = match conn.query_row(
@@ -340,8 +339,8 @@ async fn get_artist(State(state): State<AppState>, AxumPath(id): AxumPath<i64>) 
          )
          ORDER BY al.name COLLATE NOCASE", params![id]);
 
-    let mut primary_tracks = query_role_tracks(&conn, id, "primary");
-    let mut featured_tracks = query_role_tracks(&conn, id, "featured");
+    let primary_tracks = query_role_tracks(&conn, id, "primary");
+    let featured_tracks = query_role_tracks(&conn, id, "featured");
 
     Json(json!({
         "artist": artist,
@@ -354,7 +353,7 @@ async fn get_artist(State(state): State<AppState>, AxumPath(id): AxumPath<i64>) 
 }
 
 async fn get_artist_tracks(State(state): State<AppState>, AxumPath(id): AxumPath<i64>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let exists: bool = conn.query_row("SELECT 1 FROM artists WHERE id = ?", [id], |_| Ok(true)).unwrap_or(false);
@@ -367,7 +366,7 @@ async fn get_artist_tracks(State(state): State<AppState>, AxumPath(id): AxumPath
          WHERE ta.artist_id = ?
          ORDER BY ta.role, t.album COLLATE NOCASE, COALESCE(t.disk_number, 1), COALESCE(t.track_number, 0)",
     ).unwrap();
-    let mut tracks_raw: Vec<(Track, String)> = stmt
+    let tracks_raw: Vec<(Track, String)> = stmt
         .query_map([id], |row| {
             let t = row_to_track(row)?;
             let role: String = row.get("role")?;
@@ -395,7 +394,7 @@ async fn get_artist_tracks(State(state): State<AppState>, AxumPath(id): AxumPath
 // ── liked ───────────────────────────────────────────────────
 
 async fn get_liked(State(state): State<AppState>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let mut stmt = conn.prepare("SELECT * FROM tracks WHERE liked = 1 ORDER BY date_added DESC").unwrap();
@@ -406,7 +405,7 @@ async fn get_liked(State(state): State<AppState>) -> Response {
 
 async fn toggle_like(State(state): State<AppState>, AxumPath(track_id): AxumPath<i64>, body: Json<Value>) -> Response {
     let liked = body.0.get("liked").and_then(|v| v.as_bool()).unwrap_or(false);
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let n = conn.execute("UPDATE tracks SET liked = ? WHERE id = ?", params![liked as i32, track_id]).unwrap_or(0);
@@ -417,7 +416,7 @@ async fn toggle_like(State(state): State<AppState>, AxumPath(track_id): AxumPath
 }
 
 async fn mark_played(State(state): State<AppState>, AxumPath(track_id): AxumPath<i64>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let n = conn.execute("UPDATE tracks SET play_count = play_count + 1 WHERE id = ?", [track_id]).unwrap_or(0);
@@ -430,7 +429,7 @@ async fn mark_played(State(state): State<AppState>, AxumPath(track_id): AxumPath
 // ── metadata editor ─────────────────────────────────────────
 
 async fn get_track_metadata(State(state): State<AppState>, AxumPath(track_id): AxumPath<i64>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let path = match conn.query_row("SELECT path FROM tracks WHERE id = ?", [track_id], |row| row.get::<usize, String>(0)) {
@@ -448,7 +447,7 @@ async fn patch_track_metadata(
     AxumPath(track_id): AxumPath<i64>,
     body: Json<Value>,
 ) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let path = match conn.query_row("SELECT path FROM tracks WHERE id = ?", [track_id], |row| row.get::<usize, String>(0)) {
@@ -616,7 +615,7 @@ fn sync_imported_playlist_to_disk(conn: &Connection, playlist_id: i64) {
 }
 
 async fn get_playlists(State(state): State<AppState>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let mut stmt = match conn.prepare(
@@ -651,7 +650,7 @@ async fn create_playlist(State(state): State<AppState>, body: Json<Value>) -> Re
         return err(StatusCode::BAD_REQUEST, "name required");
     }
     let description = body.0.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let max_pos: i64 = conn.query_row("SELECT COALESCE(MAX(position), -1) FROM playlists", [], |r| r.get(0)).unwrap_or(-1);
@@ -673,7 +672,7 @@ async fn create_playlist(State(state): State<AppState>, body: Json<Value>) -> Re
 }
 
 async fn get_playlist(State(state): State<AppState>, AxumPath(id): AxumPath<i64>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let p = conn.query_row(
@@ -732,7 +731,7 @@ async fn get_playlist(State(state): State<AppState>, AxumPath(id): AxumPath<i64>
 }
 
 async fn rename_playlist(State(state): State<AppState>, AxumPath(id): AxumPath<i64>, body: Json<Value>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let existing = conn.query_row(
@@ -763,7 +762,7 @@ async fn rename_playlist(State(state): State<AppState>, AxumPath(id): AxumPath<i
 }
 
 async fn delete_playlist(State(state): State<AppState>, AxumPath(id): AxumPath<i64>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let _ = conn.execute("DELETE FROM playlists WHERE id = ?", [id]);
@@ -909,7 +908,7 @@ fn mime_for_ext(ext: &str) -> &'static str {
 }
 
 async fn stream_track(State(state): State<AppState>, AxumPath(track_id): AxumPath<i64>, headers: HeaderMap) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let path = match conn.query_row("SELECT path FROM tracks WHERE id = ?", [track_id], |row| row.get::<usize, String>(0)) {
@@ -1002,7 +1001,7 @@ async fn stream_track(State(state): State<AppState>, AxumPath(track_id): AxumPat
 }
 
 async fn cover_track(State(state): State<AppState>, AxumPath(track_id): AxumPath<i64>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let album_id: Option<i64> = conn.query_row("SELECT album_id FROM tracks WHERE id = ?", [track_id], |row| row.get(0)).ok();
@@ -1036,7 +1035,7 @@ async fn cover_track(State(state): State<AppState>, AxumPath(track_id): AxumPath
 // ============================================================
 
 async fn scan_status(State(state): State<AppState>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let tracks: i64 = count_rows(&conn, "tracks");
@@ -1180,7 +1179,7 @@ async fn clear_canvas_cache(State(state): State<AppState>, Json(body): Json<Clea
 
 async fn get_artist_image_route(State(state): State<AppState>, AxumPath(artist_id): AxumPath<i64>) -> Response {
     let pool = state.pool.clone();
-    let Ok(mut conn) = get_conn(&pool) else {
+    let Ok(conn) = get_conn(&pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let artist_name: Option<String> = conn
@@ -1199,7 +1198,7 @@ async fn get_artist_image_route(State(state): State<AppState>, AxumPath(artist_i
 }
 
 async fn get_track_artists(State(state): State<AppState>, AxumPath(track_id): AxumPath<i64>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let mut stmt = conn.prepare("SELECT a.id, a.name, a.image_path, ta.role FROM track_artists ta JOIN artists a ON a.id = ta.artist_id WHERE ta.track_id = ? ORDER BY ta.position").unwrap();
@@ -1216,7 +1215,7 @@ async fn get_track_artists(State(state): State<AppState>, AxumPath(track_id): Ax
 
 async fn follow_artist(State(state): State<AppState>, AxumPath(artist_id): AxumPath<i64>, body: Json<Value>) -> Response {
     let follow = body.0.get("follow").and_then(|v| v.as_bool()).unwrap_or(false);
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let exists = conn.query_row("SELECT 1 FROM artists WHERE id = ?", [artist_id], |_| Ok(true)).unwrap_or(false);
@@ -1232,7 +1231,7 @@ async fn follow_artist(State(state): State<AppState>, AxumPath(artist_id): AxumP
 }
 
 async fn get_follows(State(state): State<AppState>) -> Response {
-    let Ok(mut conn) = get_conn(&state.pool) else {
+    let Ok(conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
     };
     let mut stmt = conn.prepare("SELECT af.artist_id, af.followed_at, a.name FROM artist_follows af JOIN artists a ON a.id = af.artist_id ORDER BY af.followed_at DESC").unwrap();
