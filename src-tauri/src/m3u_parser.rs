@@ -104,3 +104,40 @@ pub fn read_m3u_file(file_path: &Path) -> std::io::Result<M3uParseResult> {
     }
     Ok(result)
 }
+
+/// An entry to write into an .m3u/.m3u8 file.
+pub struct M3uWriteEntry {
+    pub duration: Option<f64>,
+    pub title: Option<String>,
+    pub path: String,
+}
+
+/// Serialize a playlist back to an .m3u8 file on disk (overwriting).
+/// `#EXTINF:<seconds>,<title>` lines are emitted when a title is available.
+/// Entries whose track was matched use the track's absolute file path; unmatched
+/// entries fall back to their original raw text so they are preserved.
+pub fn write_m3u_file(
+    file_path: &Path,
+    name: &str,
+    entries: &[M3uWriteEntry],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(file_path)?;
+    writeln!(f, "#EXTM3U")?;
+    if !name.is_empty() {
+        writeln!(f, "#PLAYLIST:{}", name)?;
+    }
+    for e in entries {
+        let dur = e
+            .duration
+            .map(|d| d.round() as i64)
+            .filter(|d| *d > 0)
+            .unwrap_or(-1);
+        match &e.title {
+            Some(t) if !t.is_empty() => writeln!(f, "#EXTINF:{},{}", dur, t)?,
+            _ => writeln!(f, "#EXTINF:{}", dur)?,
+        }
+        writeln!(f, "{}", e.path)?;
+    }
+    Ok(())
+}

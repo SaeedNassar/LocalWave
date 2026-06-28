@@ -43,7 +43,7 @@ pub fn walk_files(root: &str, exts: &[Arc<str>]) -> (Vec<PathBuf>, Vec<PathBuf>)
         let ext_with_dot = if ext.is_empty() { String::new() } else { format!(".{}", ext) };
         if is_supported_audio(&ext_with_dot, exts) {
             audio.push(path);
-        } else if PLAYLIST_EXTS.contains(ext.as_str()) {
+        } else if PLAYLIST_EXTS.contains(&ext_with_dot) {
             playlists.push(path);
         }
     }

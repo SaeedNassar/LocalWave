@@ -9,7 +9,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::Router;
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -544,6 +544,77 @@ fn shape_playlist_value(id: i64, name: &str, description: Option<&str>, created_
     })
 }
 
+/// Write an imported playlist's current DB state back to its source .m3u file.
+/// Only fires for playlists with `is_imported = 1` and a non-empty `source`.
+/// Failures are logged, not fatal — the DB mutation already succeeded.
+fn sync_imported_playlist_to_disk(conn: &Connection, playlist_id: i64) {
+    let row = conn.query_row(
+        "SELECT name, source FROM playlists WHERE id = ? AND is_imported = 1",
+        [playlist_id],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+    );
+    let (name, source): (String, Option<String>) = match row {
+        Ok(x) => x,
+        Err(_) => return, // not imported or not found — nothing to sync
+    };
+    let source_path = match source {
+        Some(ref s) if !s.is_empty() => PathBuf::from(s),
+        _ => return,
+    };
+    let base_dir = source_path.parent().map(|p| p.to_path_buf());
+
+    let mut stmt = match conn.prepare(
+        "SELECT pe.raw_entry, pe.title, pe.missing, t.path, t.duration, t.artist, t.title AS track_title
+         FROM playlist_entries pe
+         LEFT JOIN tracks t ON t.id = pe.track_id
+         WHERE pe.playlist_id = ?
+         ORDER BY pe.position",
+    ) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let rows: Vec<(String, Option<String>, i64, Option<String>, Option<f64>, Option<String>, Option<String>)> = stmt
+        .query_map([playlist_id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
+        })
+        .ok()
+        .map(|m| m.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default();
+    drop(stmt);
+
+    use crate::m3u_parser::M3uWriteEntry;
+    let mut entries: Vec<M3uWriteEntry> = Vec::with_capacity(rows.len());
+    for (raw_entry, ext_title, missing, track_path, duration, artist, track_title) in rows {
+        if missing == 1 {
+            entries.push(M3uWriteEntry { duration: None, title: if ext_title.is_some() { ext_title } else { None }, path: raw_entry });
+            continue;
+        }
+        let path_line = match track_path {
+            Some(ref tp) => {
+                let p = PathBuf::from(tp);
+                if let Some(ref base) = base_dir {
+                    p.strip_prefix(base).map(|r| r.to_string_lossy().into_owned()).unwrap_or_else(|_| tp.clone())
+                } else {
+                    tp.clone()
+                }
+            }
+            None => raw_entry,
+        };
+        let title = ext_title
+            .or_else(|| match (artist, track_title) {
+                (Some(a), Some(t)) => Some(format!("{} - {}", a, t)),
+                (Some(a), None) => Some(a),
+                (None, Some(t)) => Some(t),
+                _ => None,
+            });
+        entries.push(M3uWriteEntry { duration, title, path: path_line });
+    }
+
+    if let Err(e) = crate::m3u_parser::write_m3u_file(&source_path, &name, &entries) {
+        log::warn!("[playlist] failed to sync imported playlist {} to {}: {}", playlist_id, source_path.display(), e);
+    }
+}
+
 async fn get_playlists(State(state): State<AppState>) -> Response {
     let Ok(mut conn) = get_conn(&state.pool) else {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db error");
@@ -679,6 +750,7 @@ async fn rename_playlist(State(state): State<AppState>, AxumPath(id): AxumPath<i
         old_desc
     };
     let _ = conn.execute("UPDATE playlists SET name = ?, description = ? WHERE id = ?", params![&name, &desc, id]);
+    sync_imported_playlist_to_disk(&conn, id);
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM playlist_entries WHERE playlist_id = ?", [id], |r| r.get(0)).unwrap_or(0);
     let row = conn.query_row("SELECT created_at, is_imported, source, position FROM playlists WHERE id = ?", [id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<i64>>(3)?))
@@ -724,6 +796,7 @@ async fn add_tracks_to_playlist(State(state): State<AppState>, AxumPath(id): Axu
         added += 1;
     }
     let _ = tx.commit();
+    sync_imported_playlist_to_disk(&conn, id);
     (StatusCode::CREATED, Json(json!({ "added": added }))).into_response()
 }
 
@@ -753,6 +826,7 @@ async fn remove_track_from_playlist(State(state): State<AppState>, AxumPath(para
         let _ = tx.execute("UPDATE playlist_entries SET position = ? WHERE playlist_id = ? AND position = ?", params![i as i64, id, old_pos]);
     }
     let _ = tx.commit();
+    sync_imported_playlist_to_disk(&conn, id);
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -781,7 +855,9 @@ async fn reorder_playlist(State(state): State<AppState>, AxumPath(id): AxumPath<
     let tx = conn.transaction().unwrap();
     for old in &positions { let _ = tx.execute("UPDATE playlist_entries SET position = position + ? WHERE playlist_id = ? AND position = ?", params![OFFSET, id, old]); }
     for (idx, old) in positions.iter().enumerate() { let _ = tx.execute("UPDATE playlist_entries SET position = ? WHERE playlist_id = ? AND position = ?", params![idx as i64, id, old + OFFSET]); }
-    let _ = tx.commit();
+    if tx.commit().is_ok() {
+        sync_imported_playlist_to_disk(&conn, id);
+    }
     Json(json!({ "ok": true })).into_response()
 }
 
